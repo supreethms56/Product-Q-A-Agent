@@ -36,6 +36,25 @@ TEST_QUERIES = [
     "Does the GRIDWATCH AI use clamp-on CT sensors?",
 ]
 
+# Words damaged by the PDF-to-Markdown conversion (the "ff" ligature was lost),
+# plus one typo. Found by reading the whole catalogue.
+PDF_FIXES = {
+    "eficiency": "efficiency",
+    "ofering": "offering",
+    "Of-Grid": "Off-Grid",
+    "Ofline": "Offline",
+    "diferences": "differences",
+    "settings an batteries": "settings and batteries",
+}
+
+# Common words ignored by BM25, so they don't give unrelated chunks a keyword score.
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for",
+    "from", "has", "have", "how", "i", "if", "in", "is", "it", "its", "me", "my",
+    "of", "on", "or", "our", "so", "that", "the", "their", "there", "this", "to",
+    "we", "what", "when", "where", "which", "who", "why", "will", "with", "you", "your",
+}
+
 
 # ==============================================================================
 # 1. INGESTION & CHUNKING (R1, R2)
@@ -46,8 +65,13 @@ def clean_markdown(raw_text: str) -> str:
     text = re.sub(r"<!--.*?-->", "", raw_text)
     # Remove markdown image tags such as ![img_001](../../assets/...)
     text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    # Fix words damaged by the PDF conversion
+    for wrong, right in PDF_FIXES.items():
+        text = text.replace(wrong, right)
     # Normalize tabs and multiple spaces inside lines
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    # Use one bullet style ("• " and "•<tab>" both become "- ")
+    lines = [re.sub(r"^•\s*", "- ", line) for line in lines]
     # Collapse 3+ blank lines into 2
     cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     return cleaned
@@ -185,7 +209,7 @@ def load_or_create_embeddings(
 # 3. HYBRID RETRIEVAL: COSINE SIMILARITY + BM25 (R4, R11)
 # ==============================================================================
 def tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
+    return [t for t in re.findall(r"[a-z0-9]+", text.lower()) if t not in STOPWORDS]
 
 
 def compute_bm25_scores(query: str, chunks: list[dict[str, Any]], k1: float = 1.5, b: float = 0.75) -> list[float]:
@@ -258,25 +282,101 @@ def retrieve_chunks(
             }
         )
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    # Products named in the question go first, so the model reads the asked-about
+    # product before any similar one (e.g. GRIDWATCH AI before GRIDWATCH PULSE).
+    named = find_named_products(query, chunks)
+    results.sort(key=lambda x: (x["product_name"] in named, x["score"]), reverse=True)
     return results[:top_k]
+
+
+def find_named_products(query: str, chunks: list[dict[str, Any]]) -> set[str]:
+    """Return product names that appear word-for-word in the question."""
+    q = query.lower()
+    return {
+        c["product_name"]
+        for c in chunks
+        if re.search(r"\b" + re.escape(c["product_name"].lower()) + r"\b", q)
+    }
 
 
 # ==============================================================================
 # 4. GROUNDED ANSWER GENERATION (R5, R6, R7)
 # ==============================================================================
-SYSTEM_PROMPT = """You are a strict product documentation assistant for Brightmere Energy.
-The catalogue snapshot is dated March 2026.
+NOT_FOUND_MESSAGE = (
+    "Sorry, I don't have that information. Our product catalogue doesn't cover it."
+)
 
-RULES:
-1. Answer ONLY using the facts explicitly written in the PROVIDED CONTEXT below.
-2. Do NOT use outside knowledge, assumptions, or guesses.
-3. If the context does not contain enough information to answer the question, reply:
-   "I cannot find that information in the Brightmere Energy product catalogue."
-4. Keep your answer concise, factual, and directly tied to the product names in the context.
-5. Pay close attention to launch dates or availability notes (e.g., if a product is launching in Q1 2027, it is not yet available for general purchase in March 2026; only pilot units via dealers are mentioned).
-6. Do NOT confuse features between two different products in the context. Check which product heading each bullet point belongs to before answering.
+SYSTEM_PROMPT = f"""You are the Brightmere Energy product assistant. You help customers and installers
+choose and understand Brightmere solar products. Speak naturally, like a knowledgeable product
+specialist talking to a customer.
+
+You will receive product information from the Brightmere catalogue (dated March 2026).
+It is your ONLY source of facts.
+
+HOW TO ANSWER:
+- Answer directly and naturally, in a friendly, professional tone. Use 1 to 4 short sentences,
+  or a short list when comparing products.
+- Never mention "context", "provided information", "sections", "excerpts" or "tags".
+  Do not start with phrases like "Based on the information" or "According to the context".
+  Just answer.
+- Do not copy the [product] tags into your answer.
+
+ACCURACY RULES (always follow these):
+1. Only state facts given in the product information. Never add facts, numbers, comparisons or
+   opinions that are not there.
+2. Each line is tagged with its product, like [GRIDWATCH AI]. A fact belongs ONLY to that product.
+   Never move a feature from one product to another.
+3. Lines tagged [Shared: <category>] apply to every product in that category.
+4. For a yes/no question about a product, check that product's own lines. If they say it does not
+   need or have something, the answer is no.
+5. If the information gives a launch date or availability, share it and mention that it comes from
+   our March 2026 catalogue, so the customer should check with their dealer for current availability.
+6. If the product information has nothing that answers the question, reply exactly:
+   "{NOT_FOUND_MESSAGE}"
 """
+
+
+def build_tagged_context(item: dict[str, Any]) -> str:
+    """Tag every line with the product (or shared category) it belongs to,
+    so a small model cannot mix up features between products."""
+    product_tag = f"[{item['product_name']}]"
+    shared_tag = f"[Shared: {item['category']}]"
+    tag = product_tag
+    lines = [f"--- PRODUCT SECTION: {item['product_name']} ---"]
+    for line in item["content"].splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("Category Overview & Shared Features"):
+            tag = shared_tag
+            continue
+        if line.startswith("Product: "):
+            tag = product_tag
+            continue
+        if line.startswith("Category: "):
+            lines.append(line)
+            continue
+        lines.append(f"{tag} {line}")
+    return "\n".join(lines)
+
+# Phrases a small model sometimes adds that make answers sound robotic.
+ROBOTIC_OPENERS = re.compile(
+    r"^(based on|according to|from|using|as per)\s+(the\s+)?"
+    r"(provided\s+|given\s+|above\s+)?"
+    r"(context|information|product information|catalogue information|excerpts?|sections?)"
+    r"(\s+provided|\s+given|\s+above)?\s*[,:]\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_answer(text: str) -> str:
+    """Remove robotic openers and leftover [product] tags, then tidy the answer."""
+    answer = text.strip()
+    answer = ROBOTIC_OPENERS.sub("", answer)
+    answer = re.sub(r"\[(Shared: )?[A-Z0-9][A-Za-z0-9 &\-]*\]\s*", "", answer)
+    answer = re.sub(r"[ \t]{2,}", " ", answer).strip()
+    if answer:
+        answer = answer[0].upper() + answer[1:]
+    return answer
 
 
 def generate_grounded_answer(
@@ -284,20 +384,13 @@ def generate_grounded_answer(
 ) -> tuple[str, list[str]]:
     """Generate a grounded response and return (answer_text, cited_product_names)."""
     if not retrieved or retrieved[0]["cosine_score"] < SETTINGS["MIN_RELEVANCE_SCORE"]:
-        return (
-            "I cannot find that information in the Brightmere Energy product catalogue.",
-            [],
-        )
+        return NOT_FOUND_MESSAGE, []
 
-    context_blocks = []
-    for item in retrieved:
-        context_blocks.append(f"--- PRODUCT SECTION: {item['product_name']} ---\n{item['content']}")
-    context_str = "\n\n".join(context_blocks)
+    context_str = "\n\n".join(build_tagged_context(item) for item in retrieved)
 
     user_message = (
-        f"PROVIDED CONTEXT:\n{context_str}\n\n"
-        f"QUESTION: {query}\n\n"
-        f"Answer strictly from the PROVIDED CONTEXT:"
+        f"Product information:\n{context_str}\n\n"
+        f"Customer question: {query}"
     )
 
     response = client.chat.completions.create(
@@ -313,7 +406,7 @@ def generate_grounded_answer(
     answer = (response.choices[0].message.content or "").strip()
 
     # Determine which retrieved sections were actually referenced or relevant
-    if "cannot find that information" in answer.lower():
+    if NOT_FOUND_MESSAGE.lower() in answer.lower():
         sources = []
     else:
         mentioned = [
@@ -407,6 +500,10 @@ def main() -> None:
     parser.add_argument("--eval", action="store_true", help="Run the 7 evaluation queries")
     parser.add_argument("--debug", action="store_true", help="Print similarity scores for retrieved chunks")
     args = parser.parse_args()
+
+    # Print °, ’ and other symbols correctly on Windows consoles and in redirected output
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
 
     chunks = parse_and_chunk_catalogue(SETTINGS["CATALOGUE_PATH"])
     print(f"Loaded {len(chunks)} product sections from {SETTINGS['CATALOGUE_PATH']}")
