@@ -1,0 +1,13 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local embedding cache
+.embeddings_cache.json
+*.npy
+
+# Python cache & env files
+__pycache__/
+*.py[cod]
+.env
