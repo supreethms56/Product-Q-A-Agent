@@ -14,16 +14,35 @@ from openai import OpenAI
 # ==============================================================================
 # CONFIGURATION & SETTINGS (Single place as required)
 # ==============================================================================
+# ==============================================================================
+# CONFIGURATION & SETTINGS (Single place as required)
+# ==============================================================================
+def load_dotenv_file(path: str = ".env") -> None:
+    """Read KEY=VALUE lines from .env into environment variables."""
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_dotenv_file()
+
 SETTINGS = {
-    "LM_STUDIO_BASE_URL": os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
-    "LM_STUDIO_API_KEY": os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
-    "EMBEDDING_MODEL": os.getenv("EMBEDDING_MODEL", "text-embedding-nomic-embed-text-v1.5"),
-    "CHAT_MODEL": os.getenv("CHAT_MODEL", "lfm2.5-1.2b-instruct"),
+    "BASE_URL": os.getenv("BASE_URL", "https://openrouter.ai/api/v1"),
+    "API_KEY": os.getenv("OPENROUTER_API_KEY", ""),
+    "EMBEDDING_MODEL": os.getenv("EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free"),
+    "CHAT_MODEL": os.getenv("CHAT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
     "CATALOGUE_PATH": "product_catalogue.md",
     "CACHE_PATH": ".embeddings_cache.json",
     "TOP_K": 3,
-    "HYBRID_ALPHA": 0.65,  # Weight for dense vector similarity vs BM25 keyword score
-    "MIN_RELEVANCE_SCORE": 0.35,  # Threshold below which query is treated as out-of-scope
+    "HYBRID_ALPHA": 0.65,
+    "MIN_RELEVANCE_SCORE": float(os.getenv("MIN_RELEVANCE_SCORE", "0.20")),
+    "MAX_TOKENS": int(os.getenv("MAX_TOKENS", "1000")),
 }
 
 TEST_QUERIES = [
@@ -157,9 +176,12 @@ def parse_and_chunk_catalogue(filepath: str) -> list[dict[str, Any]]:
 # 2. EMBEDDINGS & LOCAL CACHE (R3)
 # ==============================================================================
 def get_client() -> OpenAI:
+    if not SETTINGS["API_KEY"]:
+        sys.exit("OPENROUTER_API_KEY is not set. Add it to your .env file.")
     return OpenAI(
-        base_url=SETTINGS["LM_STUDIO_BASE_URL"],
-        api_key=SETTINGS["LM_STUDIO_API_KEY"],
+        base_url=SETTINGS["BASE_URL"],
+        api_key=SETTINGS["API_KEY"],
+        default_headers={"X-Title": "Brightmere Product Q&A Agent"},
     )
 
 
@@ -175,6 +197,7 @@ def embed_texts(client: OpenAI, texts: list[str]) -> list[list[float]]:
     response = client.embeddings.create(
         model=SETTINGS["EMBEDDING_MODEL"],
         input=texts,
+        encoding_format="float",
     )
     return [item.embedding for item in response.data]
 
@@ -194,8 +217,7 @@ def load_or_create_embeddings(
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # Nomic models perform best with 'search_document: ' prefix on corpus chunks
-    texts_to_embed = [f"search_document: {c['content']}" for c in chunks]
+    texts_to_embed = [c["content"] for c in chunks]
     vectors = embed_texts(client, texts_to_embed)
 
     cache_path.write_text(
@@ -256,8 +278,7 @@ def retrieve_chunks(
     top_k: int = SETTINGS["TOP_K"],
 ) -> list[dict[str, Any]]:
     """Rank chunks using hybrid dense cosine similarity + normalized BM25."""
-    # Nomic models perform best with 'search_query: ' prefix on queries
-    q_vec = np.array(embed_texts(client, [f"search_query: {query}"])[0], dtype=np.float32)
+    q_vec = np.array(embed_texts(client, [query])[0], dtype=np.float32)
 
     # Cosine similarity
     chunk_norms = np.linalg.norm(chunk_embeddings, axis=1)
@@ -396,7 +417,7 @@ def generate_grounded_answer(
     response = client.chat.completions.create(
         model=SETTINGS["CHAT_MODEL"],
         temperature=0.0,
-        max_tokens=300,
+        max_tokens=SETTINGS["MAX_TOKENS"],
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
@@ -517,8 +538,8 @@ def main() -> None:
         embeddings = load_or_create_embeddings(client, chunks)
     except Exception as exc:
         print(
-            f"Error connecting to LM Studio at {SETTINGS['LM_STUDIO_BASE_URL']}: {exc}\n"
-            "Ensure LM Studio's local server is running with both models loaded.",
+            f"Error calling OpenRouter at {SETTINGS['BASE_URL']}: {exc}\n"
+            "Check your OPENROUTER_API_KEY and model names in .env.",
             file=sys.stderr,
         )
         sys.exit(1)
